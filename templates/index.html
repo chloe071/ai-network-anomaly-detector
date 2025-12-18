@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AI Network Anomaly Detector</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <!-- Tailwind CSS (Play CDN) -->
+    <script src="https://cdn.tailwindcss.com/3.4.16"></script>
+
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+    <div class="max-w-5xl mx-auto px-4 py-8">
+        <header class="mb-8 flex items-center justify-between">
+            <div>
+                <h1 class="text-3xl font-bold tracking-tight">AI Network Anomaly Detector</h1>
+                <p class="text-sm text-slate-400 mt-1">
+                    Simulated traffic • Z-score anomaly detection • Live dashboard
+                </p>
+            </div>
+        </header>
+
+        <!-- Controls -->
+        <div class="mb-6 flex flex-wrap gap-3">
+            <button onclick="capture()"
+                class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-sm font-medium">
+                Capture Traffic (10s)
+            </button>
+            <button onclick="scan()"
+                class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium">
+                Detect Anomalies
+            </button>
+            <button onclick="loadDashboard()"
+                class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm font-medium">
+                Refresh Dashboard
+            </button>
+        </div>
+
+        <form id="upload-form" class="mt-4 flex items-center gap-3" onsubmit="uploadCsv(event)">
+  <label class="text-xs text-slate-400">
+    Import flows CSV
+    <input type="file" name="file" id="csvFile" accept=".csv"
+           class="block text-xs text-slate-200 mt-1">
+  </label>
+  <button type="submit"
+          class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium">
+    Run Detection on CSV
+  </button>
+</form>
+
+
+        <!-- Status + stats -->
+        <div id="status" class="mb-4 text-sm text-slate-300"></div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+            <div class="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
+                <p class="text-xs text-slate-400">Total Packets</p>
+                <p id="stat-total" class="text-2xl font-semibold mt-1">-</p>
+            </div>
+            <div class="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
+                <p class="text-xs text-slate-400">Anomalies</p>
+                <p id="stat-anomalies" class="text-2xl font-semibold mt-1">-</p>
+            </div>
+            <div class="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
+                <p class="text-xs text-slate-400">Top Source IPs</p>
+                <p id="stat-ips" class="text-sm mt-1 whitespace-pre-wrap"></p>
+            </div>
+        </div>
+
+        <!-- Charts -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+            <div class="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
+                <h2 class="text-sm font-semibold mb-2">Packet Length Distribution</h2>
+                <canvas id="lengthChart" class="w-full h-64"></canvas>
+            </div>
+            <div class="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
+                <h2 class="text-sm font-semibold mb-2">Anomaly Scores Over Time</h2>
+                <canvas id="scoreChart" class="w-full h-64"></canvas>
+            </div>
+        </div>
+
+        <!-- Anomaly list -->
+        <div class="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
+            <h2 class="text-sm font-semibold mb-3">Recent Anomalies</h2>
+<div class="overflow-x-auto">
+  <table class="min-w-full text-xs text-left border-collapse">
+    <thead class="bg-slate-900/80 text-slate-300">
+      <tr>
+        <th class="px-3 py-2 font-medium">Src IP</th>
+        <th class="px-3 py-2 font-medium">Dst IP</th>
+        <th class="px-3 py-2 font-medium">Src Port</th>
+        <th class="px-3 py-2 font-medium">Dst Port</th>
+        <th class="px-3 py-2 font-medium">Length</th>
+        <th class="px-3 py-2 font-medium">Score</th>
+        <th class="px-3 py-2 font-medium">Time</th>
+      </tr>
+    </thead>
+    <tbody id="results" class="divide-y divide-slate-800"></tbody>
+  </table>
+</div>
+    </div>
+
+    <script>
+        let lengthChart, scoreChart;
+
+        function setStatus(msg) {
+            document.getElementById('status').textContent = msg;
+        }
+
+        function capture() {
+            setStatus('Capturing traffic for 10 seconds...');
+            fetch('/start_capture')
+                .then(r => r.json())
+                .then(data => {
+                    setStatus(data.status || 'Capture started. Click Detect after ~10s.');
+                })
+                .catch(() => setStatus('Error starting capture.'));
+        }
+
+        function scan() {
+    setStatus('Running anomaly detection...');
+    fetch('/detect')
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                setStatus(data.error);
+                return;
+            }
+            setStatus(`Found ${data.total_anomalies} anomalies in ${data.total_packets} packets.`);
+
+            const tbody = document.getElementById('results');
+            tbody.innerHTML = '';
+
+            data.anomalies.forEach(a => {
+                const tr = document.createElement('tr');
+                tr.className = 'hover:bg-slate-900/60';
+                tr.innerHTML = `
+                    <td class="px-3 py-2">${a.src_ip}</td>
+                    <td class="px-3 py-2">${a.dst_ip}</td>
+                    <td class="px-3 py-2">${a.src_port}</td>
+                    <td class="px-3 py-2">${a.dst_port}</td>
+                    <td class="px-3 py-2">${a.length.toFixed(1)}</td>
+                    <td class="px-3 py-2">${a.anomaly_score.toFixed(3)}</td>
+                    <td class="px-3 py-2">${new Date(a.timestamp * 1000).toLocaleTimeString()}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            // Also refresh dashboard stats
+            loadDashboard();
+        })
+        .catch(() => setStatus('Error running detection.'));
+}
+
+        function loadDashboard() {
+            fetch('/dashboard')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) {
+                        setStatus(data.error);
+                        return;
+                    }
+
+                    const stats = data.stats;
+                    document.getElementById('stat-total').textContent = stats.total_packets;
+                    document.getElementById('stat-anomalies').textContent = stats.anomalies;
+                    document.getElementById('stat-ips').textContent =
+                        Object.entries(stats.top_src_ips)
+                            .map(([ip, count]) => `${ip} (${count})`)
+                            .join('\n');
+
+                    // Build charts
+                    renderCharts(data);
+                })
+                .catch(() => setStatus('Error loading dashboard.'));
+        }
+
+        function renderCharts(data) {
+            const ctxLen = document.getElementById('lengthChart').getContext('2d');
+            const ctxScore = document.getElementById('scoreChart').getContext('2d');
+
+            const labels = data.timestamps.map(ts => new Date(ts * 1000).toLocaleTimeString());
+
+            if (lengthChart) lengthChart.destroy();
+            if (scoreChart) scoreChart.destroy();
+
+            lengthChart = new Chart(ctxLen, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Packet length (bytes)',
+                        data: data.lengths,
+                        backgroundColor: 'rgba(129, 140, 248, 0.6)',
+                        borderColor: 'rgb(129, 140, 248)',
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    plugins: { legend: { labels: { color: '#e5e7eb' } } },
+                    scales: {
+                        x: { ticks: { color: '#9ca3af', maxRotation: 45, minRotation: 45 } },
+                        y: { ticks: { color: '#9ca3af' } }
+                    }
+                }
+            });
+
+            scoreChart = new Chart(ctxScore, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Anomaly score',
+                        data: data.scores,
+                        borderColor: 'rgb(16, 185, 129)',
+                        backgroundColor: 'rgba(16, 185, 129, 0.2)',
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.25,
+                        pointRadius: 0
+                    }]
+                },
+                options: {
+                    plugins: { legend: { labels: { color: '#e5e7eb' } } },
+                    scales: {
+                        x: { ticks: { color: '#9ca3af', maxRotation: 45, minRotation: 45 } },
+                        y: { ticks: { color: '#9ca3af' } }
+                    }
+                }
+            });
+        }
+
+        function uploadCsv(event) {
+    event.preventDefault();
+    const fileInput = document.getElementById('csvFile');
+    if (!fileInput.files.length) {
+        setStatus('Choose a CSV file first.');
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append('file', fileInput.files[0]);
+
+    setStatus('Uploading CSV and running detection...');
+    fetch('/upload_csv', {
+        method: 'POST',
+        body: formData
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.error) {
+            setStatus(data.error);
+            return;
+        }
+        setStatus(`CSV: ${data.total_anomalies} anomalies in ${data.total_rows} rows.`);
+        // Render anomalies in the same table
+        const tbody = document.getElementById('results');
+        tbody.innerHTML = '';
+        (data.anomalies || []).forEach(a => {
+            const tr = document.createElement('tr');
+            tr.className = 'hover:bg-slate-900/60';
+            tr.innerHTML = `
+                <td class="px-3 py-2">${a.src_ip}</td>
+                <td class="px-3 py-2">${a.dst_ip}</td>
+                <td class="px-3 py-2">${a.src_port}</td>
+                <td class="px-3 py-2">${a.dst_port}</td>
+                <td class="px-3 py-2">${Number(a.length).toFixed(1)}</td>
+                <td class="px-3 py-2">${Number(a.anomaly_score).toFixed(3)}</td>
+                <td class="px-3 py-2">${
+                    a.timestamp ? new Date(a.timestamp * 1000).toLocaleTimeString() : '-'
+                }</td>
+            `;
+            tbody.appendChild(tr);
+        });
+    })
+    .catch(() => setStatus('Error processing CSV upload.'));
+}
+    </script>
+</body>
+</html>
