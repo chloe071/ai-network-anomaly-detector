@@ -5,10 +5,39 @@ import pandas as pd
 import numpy as np
 import threading
 import time
+import os
 import joblib
 
-iso_model = joblib.load("isolation_forest.joblib")
-feature_cols = joblib.load("feature_cols.joblib")
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+iso_model = joblib.load(os.path.join(BASE_DIR, "isolation_forest.joblib"))
+feature_cols = joblib.load(os.path.join(BASE_DIR, "feature_cols.joblib"))
+
+REQUIRED_COLS = {'src_ip', 'dst_ip', 'src_port', 'dst_port', 'length', 'timestamp'}
+MAX_FLOWS = 10_000
+
+
+def build_features(df):
+    """Map flow fields onto the model's NSL-KDD feature columns.
+
+    Note: the model was trained on NSL-KDD numeric features, and live flows
+    don't have all of those fields, so packet length and ports are mapped
+    onto feature slots 0, 4, 5, 22, 23. See README "Limitations".
+    """
+    return pd.DataFrame({
+        0: pd.to_numeric(df['length']),
+        4: pd.to_numeric(df['src_port']),
+        5: pd.to_numeric(df['dst_port']),
+        22: pd.to_numeric(df['length']),
+        23: pd.to_numeric(df['dst_port']),
+    })[feature_cols].astype(float)
+
+
+def score_flows(df):
+    """Add anomaly_score and is_anomaly columns using the Isolation Forest."""
+    X_live = build_features(df)
+    df['is_anomaly'] = (iso_model.predict(X_live) == -1)
+    df['anomaly_score'] = -iso_model.decision_function(X_live)  # higher = more anomalous
+    return df
 
 # ----------------------
 # Flask + DB setup
@@ -16,7 +45,8 @@ feature_cols = joblib.load("feature_cols.joblib")
 app = Flask(__name__)
 
 # SQLite DB in project root (anomaly.db)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///anomaly.db'
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///anomaly.db')
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB upload limit
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
@@ -138,21 +168,7 @@ def detect():
     # Current capture as DataFrame
     df = pd.DataFrame(packets)
 
-    # ---- Build feature matrix for the Isolation Forest ----
-    X_live = pd.DataFrame({
-        0: df['length'],      # synthetic feature 0
-        4: df['src_port'],    # synthetic feature 4
-        5: df['dst_port'],    # synthetic feature 5
-        22: df['length'],     # synthetic feature 22
-        23: df['dst_port'],   # synthetic feature 23
-    })[feature_cols].astype(float)
-
-    # ---- Model prediction ----
-    pred_labels = (iso_model.predict(X_live) == -1)         # True for anomalies
-    scores = -iso_model.decision_function(X_live)          # higher = more anomalous
-
-    df['anomaly_score'] = scores
-    df['is_anomaly'] = pred_labels
+    df = score_flows(df)
 
     # ---- Save anomalies to SQLite with severity + tag ----
     with app.app_context():
@@ -215,48 +231,36 @@ def dashboard():
 #CSV upload + detection
 @app.route('/upload_csv', methods=['POST'])
 def upload_csv():
-     """
+    """
     Accept a CSV of flows, run the same Isolation Forest detector,
     and return anomalies as JSON.
     Expected columns: src_ip,dst_ip,src_port,dst_port,length,timestamp
-    plus any numeric columns you map to X_live.
     """
-     file = request.file.get('file')
-     if file is None or file.filename == '':
-         return jsonify({'error': 'No CSV file uploaded'}), 400
-     
-     try:
-         df = pd.read_csv(file)
-     except Exception as e:
-         return jsonify({'error': f'Failed to read CSV: {e}'}), 400
-     
-     required_cols = {'src_ip', 'dst_ip', 'src_port', 'dst_port', 'length', 'timestamp'}
-     if not required_cols.issubset(df.columns):
-         return jsonify({'error': f'CSV missing required columns: {required_cols}'}), 400
-     
-     #Build features for Isolation Forest
-     X_live = pd.DataFrame({
-         0: df['length'],
-         4: df['src_port'],
-         5: df['dst_port'],
-         22: df['length'],
-         23: df['dst_port'],
-     })[feature_cols].astype(float)
+    file = request.files.get('file')
+    if file is None or file.filename == '':
+        return jsonify({'error': 'No CSV file uploaded'}), 400
 
-     pred_labels = (iso_model.predict(X_live) == -1)
-     scores = -iso_model.decision_function(X_live)
+    try:
+        df = pd.read_csv(file)
+    except Exception:
+        return jsonify({'error': 'Failed to read CSV file'}), 400
 
-     df['anomaly_score'] = scores
-     df['is_anomaly'] = pred_labels
+    if not REQUIRED_COLS.issubset(df.columns):
+        return jsonify({'error': f'CSV missing required columns: {sorted(REQUIRED_COLS)}'}), 400
+    if len(df) > MAX_FLOWS:
+        return jsonify({'error': f'CSV has more than {MAX_FLOWS} rows'}), 400
 
-     anomalies = df[df['is_anomaly']].to_dict('records')
+    try:
+        df = score_flows(df)
+    except (ValueError, TypeError):
+        return jsonify({'error': 'length, src_port, and dst_port must be numeric'}), 400
 
-     return jsonify({
-         'total_rows': int(len(df)),
-         'total_anomalies': 
-         int(df['is_anomaly'].sum()),
-         'anomalies': anomalies[:50] #Limit for payload size
-     })
+    anomalies = df[df['is_anomaly']].to_dict('records')
+    return jsonify({
+        'total_rows': int(len(df)),
+        'total_anomalies': int(df['is_anomaly'].sum()),
+        'anomalies': anomalies[:50]  # limit payload size
+    })
 
 @app.route('/api/detect', methods=['POST'])
 def api_detect():
@@ -279,26 +283,19 @@ def api_detect():
     if not isinstance(flows, list) or not flows:
         return jsonify({'error': '"flows" must be a non-empty list'}), 400
     
+    if len(flows) > MAX_FLOWS:
+        return jsonify({'error': f'At most {MAX_FLOWS} flows per request'}), 400
+    if not all(isinstance(f, dict) for f in flows):
+        return jsonify({'error': 'Each flow must be a JSON object'}), 400
+
     df = pd.DataFrame(flows)
+    if not REQUIRED_COLS.issubset(df.columns):
+        return jsonify({'error': f'Each flow must include: {sorted(REQUIRED_COLS)}'}), 400
 
-    required = {'src_ip', 'dst_ip', 'src_port', 'dst_port', 'length', 'timestamp'}
-    if not required.issubset(df.columns):
-        return jsonify({'error': f'Each flow must include: {required}'}), 400
-    
-    #Reuse Isolation Forest pipeline
-    X_live = pd.DataFrame({
-        0: df['length'],
-        4: df['src_port'],
-        5: df['dst_port'],
-        22: df['length'],
-        23: df['dst_port'],
-    })[feature_cols].astype(float)
-
-    pred_labels = (iso_model.predict(X_live) == -1)
-    scores = -iso_model.decision_function(X_live)
-
-    df['anomaly_score'] = scores
-    df['is_anomaly'] = pred_labels
+    try:
+        df = score_flows(df)
+    except (ValueError, TypeError):
+        return jsonify({'error': 'length, src_port, and dst_port must be numeric'}), 400
 
     anomalies = df[df['is_anomaly']].to_dict('records')
 
@@ -314,4 +311,4 @@ def api_detect():
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-    app.run(debug=True)
+    app.run(debug=os.environ.get('FLASK_DEBUG') == '1')
